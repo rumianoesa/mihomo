@@ -78,15 +78,42 @@ type Hysteria2RealmOption struct {
 	Token       string   `proxy:"token,omitempty"`
 	RealmID     string   `proxy:"realm-id,omitempty"`
 	STUNServers []string `proxy:"stun-servers,omitempty"`
+	LocalPort   int      `proxy:"local-port,omitempty"`
+	IPMode      string   `proxy:"ip-mode,omitempty"`
 
 	// for ServerURL
-	SNI            string   `proxy:"sni,omitempty"`
-	SkipCertVerify bool     `proxy:"skip-cert-verify,omitempty"`
-	NameCertVerify string   `proxy:"name-cert-verify,omitempty"`
-	Fingerprint    string   `proxy:"fingerprint,omitempty"`
-	Certificate    string   `proxy:"certificate,omitempty"`
-	PrivateKey     string   `proxy:"private-key,omitempty"`
-	ALPN           []string `proxy:"alpn,omitempty"`
+	SNI            string     `proxy:"sni,omitempty"`
+	SkipCertVerify bool       `proxy:"skip-cert-verify,omitempty"`
+	NameCertVerify string     `proxy:"name-cert-verify,omitempty"`
+	Fingerprint    string     `proxy:"fingerprint,omitempty"`
+	Certificate    string     `proxy:"certificate,omitempty"`
+	PrivateKey     string     `proxy:"private-key,omitempty"`
+	ALPN           []string   `proxy:"alpn,omitempty"`
+	ECHOpts        ECHOptions `proxy:"ech-opts,omitempty"`
+}
+
+type RealmDialer struct {
+	outboundDialer qtls.PacketDialer
+	localPort      int
+	ipMode         string
+}
+
+func (rd *RealmDialer) ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+	localAddr := net.JoinHostPort("", strconv.Itoa(rd.localPort))
+	return rd.outboundDialer.ListenPacket(ctx, rd.ipMode, localAddr, rAddrPort)
+}
+
+func RealmIPMode(mode string) (string, error) {
+	switch mode {
+	case "", "dual":
+		return "udp", nil
+	case "v4":
+		return "udp4", nil
+	case "v6":
+		return "udp6", nil
+	default:
+		return "", fmt.Errorf("invalid ip-mode %q (expected v4, v6, or dual)", mode)
+	}
 }
 
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
@@ -205,6 +232,22 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		MaxConnectionReceiveWindow:     option.MaxConnectionReceiveWindow,
 	}
 
+	var packetListener qtls.PacketDialer = outbound.dialer
+	if option.RealmOpts.Enable {
+		if option.RealmOpts.LocalPort != int(uint16(option.RealmOpts.LocalPort)) {
+			return nil, errors.New("invalid local-port")
+		}
+		realmIPMode, err := RealmIPMode(option.RealmOpts.IPMode)
+		if err != nil {
+			return nil, err
+		}
+		packetListener = &RealmDialer{
+			outboundDialer: outbound.dialer,
+			localPort:      option.RealmOpts.LocalPort,
+			ipMode:         realmIPMode,
+		}
+	}
+
 	clientOptions := hysteria2.ClientOptions{
 		Context:            context.TODO(),
 		Logger:             log.SingLogger,
@@ -220,7 +263,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		UDPDisabled:        false,
 		UdpMTU:             option.UdpMTU,
 		ServerAddress:      M.ParseSocksaddr(addr),
-		PacketListener:     outbound.dialer,
+		PacketListener:     packetListener,
 		QuicDialer: qtls.QuicDialerFunc(func(ctx context.Context, addr string, dialer qtls.PacketDialer, tlsCfg *tls.Config, cfg *quic.Config, early bool) (net.PacketConn, *quic.Conn, error) {
 			err := echConfig.ClientHandle(ctx, tlsCfg)
 			if err != nil {
@@ -281,6 +324,16 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		})
 		if err != nil {
 			return nil, err
+		}
+		httpECHConfig, err := option.RealmOpts.ECHOpts.Parse()
+		if err != nil {
+			return nil, err
+		}
+		if httpECHConfig != nil {
+			err = httpECHConfig.ClientHandle(context.Background(), httpTLSClientConfig)
+			if err != nil {
+				return nil, err
+			}
 		}
 		clientOptions.RealmOptions = &realm.Options{
 			ServerURL:   option.RealmOpts.ServerURL,
